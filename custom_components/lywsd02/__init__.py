@@ -1,17 +1,21 @@
 from __future__ import annotations
 
-import time
-import struct
 import logging
+import struct
+import time
 from datetime import datetime
 
-from bleak import BleakClient
-from bleak_retry_connector import establish_connection, close_stale_connections
+from bleak.exc import BleakError
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    close_stale_connections,
+    establish_connection,
+)
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall, callback
-from homeassistant.helpers.typing import ConfigType
 from homeassistant.components import bluetooth
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers.typing import ConfigType
 
 DOMAIN = "lywsd02"
 CONF_MAC = "mac"
@@ -24,10 +28,8 @@ _UUID_TEMO = "EBE0CCBE-7A0A-4B0C-8A1A-6FF2997DA3A6"
 def get_localized_timestamp() -> int:
     """Return a timestamp adjusted for the local timezone."""
     now = int(time.time())
-    utc = datetime.utcfromtimestamp(now)
-    local = datetime.fromtimestamp(now)
-    diff = (utc - local).seconds
-    return now - diff
+    offset = datetime.now().astimezone().utcoffset()
+    return now + int(offset.total_seconds())
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -35,7 +37,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
 
-    @callback
     async def set_time(call: ServiceCall) -> None:
         mac = call.data.get(CONF_MAC, "").upper()
         if not mac:
@@ -69,31 +70,30 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         _LOGGER.info("Found '%s' - attempting to update time...", ble_device)
 
         # Prepare settings
-        temo = (call.data.get("temp_mode") or "").upper()
-        ckmo = call.data.get("clock_mode", 0)
+        temp_mode = (call.data.get("temp_mode") or "").upper()
+        clock_mode = call.data.get("clock_mode", 0)
         tout = int(call.data.get("timeout", 60))
 
-        temo_set = ckmo_set = False
         data_temp_mode = data_clock_mode = None
 
-        if temo in "CF":
-            data_temp_mode = struct.pack("B", 0x01 if temo == "F" else 0xFF)
-            temo_set = True
-            _LOGGER.debug("Temperature mode set: %s", temo)
+        if temp_mode in ("C", "F"):
+            data_temp_mode = struct.pack("B", 0x01 if temp_mode == "F" else 0xFF)
+            _LOGGER.debug("Temperature mode set: %s", temp_mode)
 
-        if ckmo in [12, 24]:
-            data_clock_mode = struct.pack("IHB", 0, 0, 0xAA if ckmo == 12 else 0x00)
-            ckmo_set = True
-            _LOGGER.debug("Clock mode set: %s", ckmo)
-
-        # Close any stale BLE connections for this device
-        await close_stale_connections(ble_device)
+        if clock_mode in (12, 24):
+            data_clock_mode = struct.pack(
+                "IHB", 0, 0, 0xAA if clock_mode == 12 else 0x00
+            )
+            _LOGGER.debug("Clock mode set: %s", clock_mode)
 
         client = None
         try:
+            # Close any stale BLE connections for this device
+            await close_stale_connections(ble_device)
+
             # Establish a reliable BLE connection with retries
             client = await establish_connection(
-                BleakClient,
+                BleakClientWithServiceCache,
                 ble_device,
                 name=f"LYWSD02_{mac}",
                 timeout=tout,
@@ -105,11 +105,22 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
             await client.write_gatt_char(_UUID_TIME, data_time)
 
-            if temo_set:
+            if data_temp_mode is not None:
                 await client.write_gatt_char(_UUID_TEMO, data_temp_mode)
 
-            if ckmo_set:
-                await client.write_gatt_char(_UUID_TIME, data_clock_mode)
+            if data_clock_mode is not None:
+                try:
+                    await client.write_gatt_char(_UUID_TIME, data_clock_mode)
+                except BleakError as err:
+                    _LOGGER.warning(
+                        "clock_mode (12/24-hour) could not be set on '%s': "
+                        "it is only supported on the LYWSD02MMC and this "
+                        "device rejected the write (%s). The time was set "
+                        "successfully; remove the 'clock_mode' parameter to "
+                        "silence this warning.",
+                        mac,
+                        err,
+                    )
 
             _LOGGER.info(
                 "Successfully updated time on '%s' to '%s' with offset '%s' hours.",
@@ -118,8 +129,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 tz_offset,
             )
 
-        except Exception as e:
-            _LOGGER.exception("Error while connecting to '%s': %s", mac, e)
+        except Exception:
+            _LOGGER.exception("Error while updating '%s'.", mac)
         finally:
             try:
                 if client and client.is_connected:
